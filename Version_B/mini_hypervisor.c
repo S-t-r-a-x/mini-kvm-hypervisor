@@ -346,9 +346,11 @@ void *run_vm(void *data) {
 				if (v.run->io.direction == KVM_EXIT_IO_OUT && v.run->io.port == 0xE9) {
 					char *p = (char *) v.run;
 					printf("%c", *(p +v.run->io.data_offset));
+					fflush(stdout);
 				} else if (v.run->io.direction == KVM_EXIT_IO_IN && v.run->io.port == 0xE9) {
 					int data;
       			  	printf("Enter a value to send to the VM:\n");
+					fflush(stdout);
       			  	scanf("%d", &data);
       			  	char *data_in = (((char*)v.run)+ v.run->io.data_offset);
       			  	// Napomena: U x86 podaci se smeštaju u memoriji po little endian poretku.
@@ -379,12 +381,6 @@ void *run_vm(void *data) {
 int main(int argc, char *argv[])
 {
 	pthread_mutex_init(&io_mutex, NULL);
-	struct vm v;
-	struct kvm_sregs sregs;
-	struct kvm_regs regs;
-	int stop = 0;
-	int ret = 0;
-	FILE* img;
 
 	// for command line parsing
 	size_t mem_size = 0;
@@ -468,7 +464,7 @@ int main(int argc, char *argv[])
 
 	mem_size = mem_size << 20; // Convert mem_size to MB
 
-	// START THREADS
+	// START VM THREADS
 	struct vm_data *args[guest_count];
 	pthread_t *vm_threads = (pthread_t*)malloc(guest_count * sizeof(pthread_t)); 
 	for(int i = 0; i < guest_count; i++) {
@@ -489,7 +485,14 @@ int main(int argc, char *argv[])
         pthread_join(vm_threads[i], NULL);
         printf("VM %d has finished.\n", i);
     }
-    
+
+	// FREE ALLOCATED MEMORY
+	free(vm_threads);
+    for(int i = 0; i < guest_count; i++) {
+		free(args[i]);
+	}
+	pthread_mutex_destroy(&io_mutex);
+
     printf("All VMs have finished. Exiting hypervisor.\n");
 	return 0;
 }
