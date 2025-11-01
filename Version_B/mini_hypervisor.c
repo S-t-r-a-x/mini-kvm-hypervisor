@@ -10,9 +10,11 @@
 #include <linux/kvm.h>
 #include <getopt.h>
 #include <stdbool.h>
+#include <pthread.h>
 
 
 #define GUEST_START_ADDR 0x0000 // Početna adresa za učitavanje gosta
+#define MAX_GUESTS 32 // max number of vm guests 
 
 // PDE bitovi
 #define PDE64_PRESENT (1u << 0)
@@ -266,87 +268,39 @@ int load_guest_image(struct vm *v, const char *image_path, uint64_t load_addr) {
 	return 0;
 }
 
-int main(int argc, char *argv[])
-{
+// for passing params
+struct vm_data {
+	size_t mem_size;
+	long page_size;
+	char *guest_path;
+};
+
+
+pthread_mutex_t io_mutex;
+
+// VM THREAD DEFINITION
+void *run_vm(void *data) {
 	struct vm v;
 	struct kvm_sregs sregs;
 	struct kvm_regs regs;
 	int stop = 0;
 	int ret = 0;
 	FILE* img;
+	struct vm_data *vd = (struct vm_data *)data;
 
-	// for command line parsing
-	size_t mem_size = 0;
-	long page_size = -1;
-	char* guest_path = NULL;
-
-	// 1. Define your long options
-    static struct option long_options[] = {
-        {"memory", required_argument, 0, 'm'},
-        {"page",   required_argument, 0, 'p'},
-        {"guest",  required_argument, 0, 'g'},
-        {0, 0, 0, 0} // End of the array
-    };
-
-    // 2. Create the short options string
-    // "m:p:g:" means m, p, and g all require an argument (the colon)
-    const char *short_opts = "m:p:g:";
-
-    int long_index = 0;
-	char opt;
-    while ((opt = getopt_long(argc, argv, short_opts, long_options, &long_index)) != -1) {
-        switch (opt) {
-            case 'm':
-                mem_size = atol(optarg); // optarg is the value (e.g., "4")
-                break;
-            case 'p':
-                page_size = atol(optarg);
-                break;
-            case 'g':
-                guest_path = optarg;
-                break;
-            case '?': // Handle unknown option
-                printf("Unknown option or missing argument.\n");
-                return 1;
-            default:
-                abort();
-        }
-    }
-
-    // 3. Validation if every value was input
-    if (mem_size == 0 || page_size == -1 || guest_path == NULL) {
-        fprintf(stderr, "Usage: %s -m <2|4|8>[KB] -p <4[KB]|2[MB]> -g <guest.img>\n", argv[0]);
-        fprintf(stderr, "   or: %s --memory <2|4|8>[KB] --page <4[KB]|2[MB]> --guest <guest.img>\n", argv[0]);
-        return 1;
-    }
-
-    // Validation for 2/4/8MB and 4KB/2MB
-
-	if ((mem_size != 2 && mem_size != 4 && mem_size != 8) || (page_size != 2 && page_size != 4)) {
-        fprintf(stderr, "Usage: %s -m <2|4|8>[KB] -p <4[KB]|2[MB]> -g <guest.img>\n", argv[0]);
-        fprintf(stderr, "   or: %s --memory <2|4|8>[KB] --page <4[KB]|2[MB]> --guest <guest.img>\n", argv[0]);
-        return 1;
-    }
-
-	// Print vm setup
-    printf("Starting VM with:\n");
-    printf("  Memory: %zu MB\n", mem_size);
-    printf("  Page Size: %ld", page_size); 
-	if(page_size == 2) printf(" MB\n");
-	else printf(" KB\n");
-    printf("  Guest: %s\n", guest_path);
-	
-	mem_size = mem_size << 20; // Convert mem_size to MB
+	size_t mem_size = vd->mem_size;
+	long page_size = vd->page_size;
+	char *guest_path = vd->guest_path;
 
 	if (vm_init(&v, mem_size)) {
 		printf("Failed to init the VM\n");
-		return 1;
+		return NULL;
 	}
 
 	if (ioctl(v.vcpu_fd, KVM_GET_SREGS, &sregs) < 0) {
 		perror("KVM_GET_SREGS");
 		vm_destroy(&v);
-		return 1;
+		return NULL;
 	}
 
 	setup_long_mode(&v, &sregs, page_size == 4);
@@ -354,14 +308,15 @@ int main(int argc, char *argv[])
     if (ioctl(v.vcpu_fd, KVM_SET_SREGS, &sregs) < 0) {
 		perror("KVM_SET_SREGS");
 		vm_destroy(&v);
-		return 1;
+		return NULL;
 	}
 
 	if (load_guest_image(&v, guest_path, GUEST_START_ADDR) < 0) {
 		printf("Failed to load guest image\n");
 		vm_destroy(&v);
-		return 1;
+		return NULL;
 	}
+
 
 	memset(&regs, 0, sizeof(regs));
 	regs.rflags = 0x2;
@@ -371,11 +326,10 @@ int main(int argc, char *argv[])
 	regs.rip = 0; 
 	regs.rsp = mem_size; // SP raste nadole
 
-	/* DEBUG: dump first 32 bytes at guest load address */
  
 	if (ioctl(v.vcpu_fd, KVM_SET_REGS, &regs) < 0) {
 		perror("KVM_SET_REGS");
-		return 1;
+		return NULL;
 	}
 
 	while(stop == 0) {
@@ -383,11 +337,12 @@ int main(int argc, char *argv[])
 		if (ret == -1) {
 			printf("KVM_RUN failed\n");
 			vm_destroy(&v);
-			return 1;
+			return NULL;
 		}
 
 		switch (v.run->exit_reason) {
 			case KVM_EXIT_IO:
+				pthread_mutex_lock(&io_mutex);
 				if (v.run->io.direction == KVM_EXIT_IO_OUT && v.run->io.port == 0xE9) {
 					char *p = (char *) v.run;
 					printf("%c", *(p +v.run->io.data_offset));
@@ -399,6 +354,8 @@ int main(int argc, char *argv[])
       			  	// Napomena: U x86 podaci se smeštaju u memoriji po little endian poretku.
       			  	(*data_in) = data;
       			}
+
+				pthread_mutex_unlock(&io_mutex);
 				continue;
 			case KVM_EXIT_HLT:
 				printf("KVM_EXIT_HLT\n");
@@ -414,5 +371,125 @@ int main(int argc, char *argv[])
     	}
   	}
 
-	vm_destroy(&v);
+	vm_destroy(&v);	
+	return NULL;
+
+}
+
+int main(int argc, char *argv[])
+{
+	pthread_mutex_init(&io_mutex, NULL);
+	struct vm v;
+	struct kvm_sregs sregs;
+	struct kvm_regs regs;
+	int stop = 0;
+	int ret = 0;
+	FILE* img;
+
+	// for command line parsing
+	size_t mem_size = 0;
+	long page_size = -1;
+	char *guest_paths[MAX_GUESTS] = {0};
+
+	// 1. Define your long options
+    static struct option long_options[] = {
+        {"memory", required_argument, 0, 'm'},
+        {"page",   required_argument, 0, 'p'},
+        {"guest",  required_argument, 0, 'g'},
+        {0, 0, 0, 0} // End of the array
+    };
+
+    // 2. Create the short options string
+    // "m:p:g:" means m, p, and g all require an argument (the colon)
+    const char *short_opts = "m:p:g:";
+
+    int guest_count = 0;
+    int long_index = 0;
+	char opt;
+    while ((opt = getopt_long(argc, argv, short_opts, long_options, &long_index)) != -1) {
+        switch (opt) {
+            case 'm':
+                mem_size = atol(optarg); // optarg is the value (e.g., "4")
+                break;
+            case 'p':
+                page_size = atol(optarg);
+                break;
+            case 'g':
+                guest_paths[guest_count++] = optarg;
+                break;
+            case '?': // Handle unknown option
+                printf("Unknown option or missing argument.\n");
+                return 1;
+            default:
+                abort();
+        }
+    }
+
+    // collect remaining guest paths 
+    while (optind < argc) {
+        if(guest_count >= MAX_GUESTS) { // MAX_GUESTS is a #define you should add
+            fprintf(stderr, "Too many guests!\n");
+            break;
+        }
+        guest_paths[guest_count++] = argv[optind++];
+    }
+
+    // 3. Validation if every value was input
+    if (mem_size == 0 || page_size == -1 || guest_count == 0) {
+        fprintf(stderr, "Usage: %s -m <2|4|8>[KB] -p <4[KB]|2[MB]> -g <guest0.img>...<guestN.img>\n", argv[0]);
+        fprintf(stderr, "   or: %s --memory <2|4|8>[KB] --page <4[KB]|2[MB]> --guest <guest0.img>...<guestN.img>\n", argv[0]);
+        return 1;
+    }
+
+    // Validation for 2/4/8MB and 4KB/2MB
+	if ((mem_size != 2 && mem_size != 4 && mem_size != 8) || (page_size != 2 && page_size != 4)) {
+        fprintf(stderr, "Usage: %s -m <2|4|8>[KB] -p <4[KB]|2[MB]> -g <guest.img>\n", argv[0]);
+        fprintf(stderr, "   or: %s --memory <2|4|8>[KB] --page <4[KB]|2[MB]> --guest <guest.img>\n", argv[0]);
+        return 1;
+    }
+
+	// Print vm setup
+    printf("Starting VM with:\n");
+    printf("  Memory: %zu MB\n", mem_size);
+    printf("  Page Size: %ld", page_size); 
+	if(page_size == 2) printf(" MB\n");
+	else printf(" KB\n");
+    printf("  Guests: ");
+    for(int i = 0; i < guest_count; i++) {
+        if(i == guest_count - 1) {
+            printf("%s ", guest_paths[i]);
+        	printf("\n");
+        }
+        else {
+            printf("%s, ", guest_paths[i]);
+
+        }
+    }
+
+	mem_size = mem_size << 20; // Convert mem_size to MB
+
+	// START THREADS
+	struct vm_data *args[guest_count];
+	pthread_t *vm_threads = (pthread_t*)malloc(guest_count * sizeof(pthread_t)); 
+	for(int i = 0; i < guest_count; i++) {
+		args[i] = (struct vm_data *)malloc(sizeof(struct vm_data));
+		args[i]->mem_size = mem_size;
+		args[i]->page_size = page_size;
+		args[i]->guest_path = guest_paths[i];
+    	if(pthread_create(&vm_threads[i], NULL, run_vm, args[i]) != 0) {
+			perror("pthread_create error!\n");
+			return -1;
+		}
+
+	}
+
+	// JOIN ALL THREADS
+    printf("All VMs running. Waiting for them to exit...\n");
+    for (int i = 0; i < guest_count; i++) {
+        pthread_join(vm_threads[i], NULL);
+        printf("VM %d has finished.\n", i);
+    }
+    
+    printf("All VMs have finished. Exiting hypervisor.\n");
+	return 0;
 }

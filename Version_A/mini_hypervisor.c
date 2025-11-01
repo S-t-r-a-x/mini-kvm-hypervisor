@@ -371,7 +371,6 @@ int main(int argc, char *argv[])
 	regs.rip = 0; 
 	regs.rsp = mem_size; // SP raste nadole
 
-	/* DEBUG: dump first 32 bytes at guest load address */
  
 	if (ioctl(v.vcpu_fd, KVM_SET_REGS, &regs) < 0) {
 		perror("KVM_SET_REGS");

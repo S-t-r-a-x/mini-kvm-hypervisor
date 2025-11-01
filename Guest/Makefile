@@ -1,8 +1,14 @@
-guest.img: guest.o
-	ld -T guest.ld guest.o -o guest.img
+GUESTS = guest.img guest2.img
 
-guest.o: guest.c
+all: $(GUESTS)
+
+%.img: %.o
+	ld -T guest.ld $< -o $@
+
+%.o: %.c
 	$(CC) -m64 -ffreestanding -fno-pic -c -o $@ $^
 
 clean:
-	rm -f guest.o guest.img
+	rm -f *.o $(GUESTS)
+
+.PHONY: all clean
