@@ -1,7 +1,15 @@
 #include <stdint.h>
 
+// out %al, (%dx)
 static void outb(uint16_t port, uint8_t value) {
 		asm("outb %0,%1" : /* empty */ : "a" (value), "Nd" (port) : "memory");
+}
+
+// in (%dx), %al
+static uint8_t inb(uint16_t port) {
+	uint8_t result;
+	asm("inb %1, %0" : "=a" (result) : "Nd" (port) : "memory");
+	return result;
 }
 
 void
@@ -17,7 +25,11 @@ _start(void) {
 	uint16_t port = 0xE9;
 
 	for (p = "Hello, world!\n"; *p; ++p)
-		outb(0xE9, *p);
+		outb(port, *p);
+	
+	uint8_t tmp = inb(port);
+	outb(port, tmp);
+
 	/*
 		INSERT CODE ABOVE THIS LINE
 	*/

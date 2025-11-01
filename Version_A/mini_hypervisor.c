@@ -191,7 +191,7 @@ static void setup_long_mode(struct vm *v, struct kvm_sregs *sregs, bool is4KB)
         
         // Calculate how many 2MB blocks we have (e.g., 8MB / 2MB = 4)
         // Each 2MB block needs one Page Directory Entry (PDE) pointing to a Table (PT)
-        size_t num_pd_entries = v->mem_size / (512 * 4096); // 512 entries  Page* 4KB = 2MB
+        size_t num_pd_entries = v->mem_size >> 21; // 512 entries  Page* 4KB = 2MB
 
         for (size_t i_pd = 0; i_pd < num_pd_entries; i_pd++) {
             // Each PD entry points to a new Page Table
@@ -391,8 +391,14 @@ int main(int argc, char *argv[])
 				if (v.run->io.direction == KVM_EXIT_IO_OUT && v.run->io.port == 0xE9) {
 					char *p = (char *) v.run;
 					printf("%c", *(p +v.run->io.data_offset));
-				}
-				fflush(stdout);
+				} else if (v.run->io.direction == KVM_EXIT_IO_IN && v.run->io.port == 0xE9) {
+					int data;
+      			  	printf("Enter a value to send to the VM:\n");
+      			  	scanf("%d", &data);
+      			  	char *data_in = (((char*)v.run)+ v.run->io.data_offset);
+      			  	// Napomena: U x86 podaci se smeštaju u memoriji po little endian poretku.
+      			  	(*data_in) = data;
+      			}
 				continue;
 			case KVM_EXIT_HLT:
 				printf("KVM_EXIT_HLT\n");
