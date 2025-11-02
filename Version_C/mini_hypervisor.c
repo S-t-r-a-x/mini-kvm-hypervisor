@@ -15,6 +15,7 @@
 
 #define GUEST_START_ADDR 0x0000 // Početna adresa za učitavanje gosta
 #define MAX_GUESTS 32 // max number of vm guests 
+#define MAX_SHARED_FILES 32 // max number of files that can be passed via the command line
 
 // PDE bitovi
 #define PDE64_PRESENT (1u << 0)
@@ -269,10 +270,12 @@ int load_guest_image(struct vm *v, const char *image_path, uint64_t load_addr) {
 }
 
 // for passing params
-struct vm_data {
+struct InitVMData {
 	size_t mem_size;
 	long page_size;
 	char *guest_path;
+	int file_count;
+	char **shared_files;
 };
 
 
@@ -286,11 +289,13 @@ void *run_vm(void *data) {
 	int stop = 0;
 	int ret = 0;
 	FILE* img;
-	struct vm_data *vd = (struct vm_data *)data;
+	struct InitVMData *init_data = (struct InitVMData *)data;
 
-	size_t mem_size = vd->mem_size;
-	long page_size = vd->page_size;
-	char *guest_path = vd->guest_path;
+	size_t mem_size = init_data->mem_size;
+	long page_size = init_data->page_size;
+	char *guest_path = init_data->guest_path;
+	int file_count = init_data->file_count;
+	char **shared_files = init_data->shared_files;
 
 	if (vm_init(&v, mem_size)) {
 		printf("Failed to init the VM\n");
@@ -343,20 +348,26 @@ void *run_vm(void *data) {
 		switch (v.run->exit_reason) {
 			case KVM_EXIT_IO:
 				pthread_mutex_lock(&io_mutex);
-				if (v.run->io.direction == KVM_EXIT_IO_OUT && v.run->io.port == 0xE9) {
-					char *p = (char *) v.run;
-					printf("%c", *(p +v.run->io.data_offset));
-					fflush(stdout);
-				} else if (v.run->io.direction == KVM_EXIT_IO_IN && v.run->io.port == 0xE9) {
-					int data;
-      			  	printf("Enter a value to send to the VM:\n");
-					fflush(stdout);
-      			  	scanf("%d", &data);
-      			  	char *data_in = (((char*)v.run)+ v.run->io.data_offset);
-      			  	// Napomena: U x86 podaci se smeštaju u memoriji po little endian poretku.
-      			  	(*data_in) = data;
-      			}
-
+				if(v.run -> io.port == 0xE9) {
+					// Regular in/out operation
+					if (v.run->io.direction == KVM_EXIT_IO_OUT) {
+						char *p = (char *) v.run;
+						printf("%c", *(p +v.run->io.data_offset));
+						fflush(stdout);
+					}
+					else if (v.run->io.direction == KVM_EXIT_IO_IN) {
+						int data;
+						printf("Enter a value to send to the VM:\n");
+						fflush(stdout);
+						scanf("%d", &data);
+						char *data_in = (((char *)v.run) + v.run->io.data_offset);
+						// Napomena: U x86 podaci se smeštaju u memoriji po little endian poretku.
+						(*data_in) = data;
+					}
+				}
+				else if(v.run->io.port == 0x0278) {
+					
+				} 
 				pthread_mutex_unlock(&io_mutex);
 				continue;
 			case KVM_EXIT_HLT:
@@ -375,7 +386,6 @@ void *run_vm(void *data) {
 
 	vm_destroy(&v);	
 	return NULL;
-
 }
 
 int main(int argc, char *argv[])
@@ -386,63 +396,87 @@ int main(int argc, char *argv[])
 	size_t mem_size = 0;
 	long page_size = -1;
 	char *guest_paths[MAX_GUESTS] = {0};
+    char *shared_files[MAX_SHARED_FILES] = {0}; 
 
 	// 1. Define your long options
     static struct option long_options[] = {
         {"memory", required_argument, 0, 'm'},
         {"page",   required_argument, 0, 'p'},
         {"guest",  required_argument, 0, 'g'},
+        {"file", required_argument, 0, 'f'},
         {0, 0, 0, 0} // End of the array
     };
 
     // 2. Create the short options string
     // "m:p:g:" means m, p, and g all require an argument (the colon)
-    const char *short_opts = "m:p:g:";
+    const char *short_opts = "m:p:g:f:";
 
     int guest_count = 0;
+    int file_count = 0;
     int long_index = 0;
-	char opt;
-    while ((opt = getopt_long(argc, argv, short_opts, long_options, &long_index)) != -1) {
-        switch (opt) {
-            case 'm':
-                mem_size = atol(optarg); // optarg is the value (e.g., "4")
-                break;
-            case 'p':
-                page_size = atol(optarg);
-                break;
-            case 'g':
-                guest_paths[guest_count++] = optarg;
-                break;
-            case '?': // Handle unknown option
-                printf("Unknown option or missing argument.\n");
-                return 1;
-            default:
-                abort();
-        }
-    }
 
-    // collect remaining guest paths 
-    while (optind < argc) {
-        if(guest_count >= MAX_GUESTS) { // MAX_GUESTS is a #define you should add
-            fprintf(stderr, "Too many guests!\n");
-            break;
+    enum parse_mode {
+        PARSE_NONE,
+        PARSE_MEM,
+        PARSE_PAGE,
+        PARSE_GUESTS,
+        PARSE_FILES
+    };
+
+    enum parse_mode mode = PARSE_NONE;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--memory") == 0) {
+            mode = PARSE_MEM;
+        } else if (strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--page") == 0) {
+            mode = PARSE_PAGE;
+        } else if (strcmp(argv[i], "-g") == 0 || strcmp(argv[i], "--guest") == 0) {
+            mode = PARSE_GUESTS;
+        } else if (strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--file") == 0) {
+            mode = PARSE_FILES;
+        } else if (argv[i][0] == '-') {
+            // Unknown option
+            fprintf(stderr, "Unknown option: %s\n", argv[i]);
+            return 1;
+        } else {
+            // This is an argument, not an option
+            switch (mode) {
+                case PARSE_MEM:
+                    mem_size = atol(argv[i]);
+                    mode = PARSE_NONE;
+                break;
+                case PARSE_PAGE:
+                    page_size = atol(argv[i]);
+                    mode = PARSE_NONE;
+                    break;
+                case PARSE_GUESTS:
+                    if (guest_count < MAX_GUESTS)
+                        guest_paths[guest_count++] = argv[i];
+                    break;
+                case PARSE_FILES:
+                    if (file_count < MAX_SHARED_FILES)
+                        shared_files[file_count++] = argv[i];
+                    break;
+                case PARSE_NONE:
+                    break;
+            }
         }
-        guest_paths[guest_count++] = argv[optind++];
     }
 
     // 3. Validation if every value was input
     if (mem_size == 0 || page_size == -1 || guest_count == 0) {
-        fprintf(stderr, "Usage: %s -m <2|4|8>[KB] -p <4[KB]|2[MB]> -g <guest0.img>...<guestN.img>\n", argv[0]);
-        fprintf(stderr, "   or: %s --memory <2|4|8>[KB] --page <4[KB]|2[MB]> --guest <guest0.img>...<guestN.img>\n", argv[0]);
+        fprintf(stderr, "Usage: %s -m <2|4|8>[KB] -p <4[KB]|2[MB]> -g <guest1.img> [guest2.img...] [-f file1...]\n", argv[0]);
+        fprintf(stderr, "   or: %s --memory <2|4|8>[KB] --page <4[KB]|2[MB]> --guest <guest1.img> [guest2.img...] [-f file1...]\n", argv[0]);
         return 1;
     }
 
     // Validation for 2/4/8MB and 4KB/2MB
 	if ((mem_size != 2 && mem_size != 4 && mem_size != 8) || (page_size != 2 && page_size != 4)) {
-        fprintf(stderr, "Usage: %s -m <2|4|8>[KB] -p <4[KB]|2[MB]> -g <guest.img>\n", argv[0]);
-        fprintf(stderr, "   or: %s --memory <2|4|8>[KB] --page <4[KB]|2[MB]> --guest <guest.img>\n", argv[0]);
+        fprintf(stderr, "Usage: %s -m <2|4|8>[KB] -p <4[KB]|2[MB]> -g <guest1.img> [guest2.img...] [-f file1...]\n", argv[0]);
+        fprintf(stderr, "   or: %s --memory <2|4|8>[KB] --page <4[KB]|2[MB]> --guest <guest.img>[guest2.img...] [-f file1...]\n", argv[0]);
         return 1;
     }
+
 
 	// Print vm setup
     printf("Starting VM with:\n");
@@ -458,20 +492,31 @@ int main(int argc, char *argv[])
         }
         else {
             printf("%s, ", guest_paths[i]);
-
+        }
+    }
+    printf("  Shared files: ");
+    for(int i = 0; i < file_count; i++) {
+        if(i == file_count - 1) {
+            printf("%s ", shared_files[i]);
+        	printf("\n");
+        }
+        else {
+            printf("%s, ", shared_files[i]);
         }
     }
 
 	mem_size = mem_size << 20; // Convert mem_size to MB
-
+	
 	// START VM THREADS
-	struct vm_data *args[guest_count];
+	struct InitVMData *args[guest_count];
 	pthread_t *vm_threads = (pthread_t*)malloc(guest_count * sizeof(pthread_t)); 
 	for(int i = 0; i < guest_count; i++) {
-		args[i] = (struct vm_data *)malloc(sizeof(struct vm_data));
+		args[i] = (struct InitVMData *)malloc(sizeof(struct InitVMData));
 		args[i]->mem_size = mem_size;
 		args[i]->page_size = page_size;
 		args[i]->guest_path = guest_paths[i];
+		args[i]->file_count = file_count;
+		args[i]->shared_files = shared_files;
     	if(pthread_create(&vm_threads[i], NULL, run_vm, args[i]) != 0) {
 			perror("pthread_create error!\n");
 			return -1;

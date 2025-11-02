@@ -269,7 +269,7 @@ int load_guest_image(struct vm *v, const char *image_path, uint64_t load_addr) {
 }
 
 // for passing params
-struct vm_data {
+struct InitVMData {
 	size_t mem_size;
 	long page_size;
 	char *guest_path;
@@ -286,7 +286,7 @@ void *run_vm(void *data) {
 	int stop = 0;
 	int ret = 0;
 	FILE* img;
-	struct vm_data *vd = (struct vm_data *)data;
+	struct InitVMData *vd = (struct InitVMData *)data;
 
 	size_t mem_size = vd->mem_size;
 	long page_size = vd->page_size;
@@ -465,10 +465,10 @@ int main(int argc, char *argv[])
 	mem_size = mem_size << 20; // Convert mem_size to MB
 
 	// START VM THREADS
-	struct vm_data *args[guest_count];
+	struct InitVMData *args[guest_count];
 	pthread_t *vm_threads = (pthread_t*)malloc(guest_count * sizeof(pthread_t)); 
 	for(int i = 0; i < guest_count; i++) {
-		args[i] = (struct vm_data *)malloc(sizeof(struct vm_data));
+		args[i] = (struct InitVMData *)malloc(sizeof(struct InitVMData));
 		args[i]->mem_size = mem_size;
 		args[i]->page_size = page_size;
 		args[i]->guest_path = guest_paths[i];
