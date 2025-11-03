@@ -463,7 +463,7 @@ void *run_vm(void *data)
 
 	char vm_dir_path[MAX_PATH_LEN];
 	// Creates e.g., "../Guest/guest_files"
-	sprintf(vm_dir_path, "../Guest/%s_files", guest_basename);
+	sprintf(vm_dir_path, "../Guest/%s_vm%d_files", guest_basename, vm_id);
 	mkdir(vm_dir_path, 0755);
 
 	// This table is local to this thread and holds this VM's state.
@@ -507,6 +507,9 @@ void *run_vm(void *data)
 	int hc_write_vfd = 0;
 	int hc_write_len = 0;
 	int hc_write_idx = 0;
+
+	memset(hc_open_path_buf, 0, MAX_GUEST_PATH_LEN);
+	memset(hc_read_buf, 0, MAX_GUEST_PATH_LEN);
 
 	if (vm_init(&v, mem_size))
 	{
@@ -607,6 +610,8 @@ void *run_vm(void *data)
 						}
 						else if (out_val == CMD_WRITE)
 						{
+							hc_write_idx = 0;
+							hc_write_len = 0;
 							fcall_state = STATE_WRITE_WANT_VFD;
 						}
 						else if (out_val == CMD_READ)
@@ -688,7 +693,7 @@ void *run_vm(void *data)
 
 							// All data received
 							char private_path[MAX_PATH_LEN];
-							sprintf(private_path, "../Guest/%s_files/%s", guest_basename, hc_open_path_buf);
+							sprintf(private_path, "../Guest/%s_vm%d_files/%s", guest_basename, vm_id,hc_open_path_buf);
 
 							char shared_check_path[MAX_PATH_LEN];
 							sprintf(shared_check_path, "../Guest/%s", hc_open_path_buf);
@@ -730,7 +735,7 @@ void *run_vm(void *data)
 								}
 								else
 								{
-									open_mode = "wb";
+									open_mode = "ab";
 								}
 							}
 
