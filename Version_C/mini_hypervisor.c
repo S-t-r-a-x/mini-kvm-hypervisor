@@ -443,16 +443,19 @@ void *run_vm(void *data) {
 
 	enum
 	{
-		STATE_IDLE, 
-		STATE_OPEN_WANT_FLAGS,	  // State 1
-		STATE_OPEN_WANT_PATH_LEN,  // State 2
-		STATE_OPEN_WANT_PATH_BYTE, // State 3
+		STATE_IDLE,
+		STATE_OPEN_WANT_FLAGS,	  
+		STATE_OPEN_WANT_PATH_LEN, 
+		STATE_OPEN_WANT_PATH_BYTE,
 
 		// STATE_WRITE_WANT_VFD,
 		// STATE_WRITE_WANT_LEN,
 		// STATE_WRITE_WANT_BYTE,
 
-		STATE_READ_WANT_VFD,
+		STATE_READ_WANT_VFD,  
+		STATE_READ_WANT_COUNT,
+		STATE_READ_SEND_COUNT,
+		STATE_READ_SEND_BYTE, 
 
 		STATE_CLOSE_WANT_VFD
 	} fcall_state = STATE_IDLE;
@@ -464,6 +467,11 @@ void *run_vm(void *data) {
     int hc_open_path_len = 0;
     int hc_open_path_idx = 0;
     int hc_open_flags = 0;
+
+	char hc_read_buf[MAX_GUEST_PATH_LEN];
+	int hc_read_len = 0;				 
+	int hc_read_idx = 0;				 
+	int hc_read_vfd = 0;
 
 	if (vm_init(&v, mem_size)) {
 		printf("Failed to init the VM\n");
@@ -552,11 +560,13 @@ void *run_vm(void *data) {
 								}
 								// --- EXPANSION: Add other commands ---
 								// else if (out_val == CMD_WRITE) {
-								//    hc_state = HC_STATE_WRITE_WANT_VFD;
+								//    fcall_state = STATE_WRITE_WANT_VFD;
 								// }
-								// else if (out_val == CMD_READ) {
-								//    hc_state = HC_STATE_READ_WANT_VFD;
-								// }
+								else if (out_val == CMD_READ) {
+									hc_read_len = 0;
+									hc_read_idx = 0;
+									fcall_state = STATE_READ_WANT_VFD;
+								}
 								else if (out_val == CMD_CLOSE) {
 								   fcall_state = STATE_CLOSE_WANT_VFD;
 								}
@@ -572,14 +582,47 @@ void *run_vm(void *data) {
 								hc_open_flags = out_val;
 								fcall_state = STATE_OPEN_WANT_PATH_LEN;
 								break;
+							case STATE_READ_WANT_VFD:
+								hc_read_vfd = (int)out_val;
+								fcall_state = STATE_READ_WANT_COUNT;
+								break;
+							case STATE_READ_WANT_COUNT:
+							{
+								int vfd = hc_read_vfd;
+								int count_requested = (int)out_val;
 
-							// --- OPEN State 2: Want Path Length ---
+								// 1. Validate request
+								if (count_requested == 0 ||
+									vfd < 0 || vfd >= MAX_VM_FILES ||
+									!my_file_table[vfd].in_use)
+								{
+									hc_read_len = -1; // Error
+								}
+								else
+								{
+									// 2. Perform the read
+									FILE *f = my_file_table[vfd].host_fd;
+									size_t bytes_read = fread(hc_read_buf, 1, count_requested, f);
+
+									if (bytes_read == 0 && ferror(f))
+									{
+										hc_read_len = -1; // Read error
+									}
+									else
+									{
+										hc_read_len = (int)bytes_read; // Success
+									}
+								}
+								hc_read_idx = 0;					 // Reset read index
+								fcall_state = STATE_READ_SEND_COUNT; // Ready for guest's *first* IN
+								break;
+							}
 							case STATE_OPEN_WANT_PATH_LEN:
 								hc_open_path_len = out_val;
 								if (hc_open_path_len == 0 || hc_open_path_len == 255)
 								{
-									hc_ret_val = -1;		  // Set error
-									fcall_state = STATE_IDLE; // Reset to idle
+									hc_ret_val = -1;		 
+									fcall_state = STATE_IDLE;
 								}
 								else
 								{
@@ -587,7 +630,6 @@ void *run_vm(void *data) {
 								}
 								break;
 
-							// --- OPEN State 3: Want Path Byte(s) ---
 							case STATE_OPEN_WANT_PATH_BYTE:
 								hc_open_path_buf[hc_open_path_idx++] = out_val;
 
@@ -595,7 +637,7 @@ void *run_vm(void *data) {
 								{
 									hc_open_path_buf[hc_open_path_len] = '\0';
 
-									// --- 1. All data received. Start sandboxing ---
+									// All data received
 									char private_path[MAX_PATH_LEN];
 									sprintf(private_path, "../Guest/%s_files/%s", guest_basename, hc_open_path_buf);
 
@@ -609,10 +651,10 @@ void *run_vm(void *data) {
 
 									if (hc_open_flags == O_READ)
 									{
-										//Check the shared path first, then the sandboxed path.
+										// Check the shared path first, then the private part
 										if (is_shared)
 										{
-											// path is already correct
+											// path is already correct, no need for adjustment
 											strncpy(final_host_path, original_shared_path, MAX_PATH_LEN);
 											
 										}
@@ -672,12 +714,41 @@ void *run_vm(void *data) {
 								break;
 							}
 						}
-						case 
+						
 					}
 					else if (v.run->io.direction == KVM_EXIT_IO_IN) {
 						// Guest is asking for the return value
-						*io_data = hc_ret_val;
-						hc_ret_val = 0; // Clear "register"
+						if (fcall_state == STATE_READ_SEND_COUNT)
+						{
+							// State 7: Guest wants the *count* of bytes read (or -1)
+							*io_data = (uint8_t)hc_read_len; // Send count (or 0xFF for -1)
+
+							if (hc_read_len > 0)
+							{
+								fcall_state = STATE_READ_SEND_BYTE; // Move to sending data
+							}
+							else
+							{
+								fcall_state = STATE_IDLE; // 0 bytes read, or error
+							}
+						}
+						else if (fcall_state == STATE_READ_SEND_BYTE)
+						{
+							// State 8: Guest is reading a byte of data
+							*io_data = hc_read_buf[hc_read_idx++];
+
+							// Check if that was the last byte
+							if (hc_read_idx == hc_read_len)
+							{
+								fcall_state = STATE_IDLE; // All done, reset
+							}
+						}
+						// --- END NEW ---
+						else // This is an IN for OPEN or CLOSE
+						{
+							*io_data = hc_ret_val;
+							hc_ret_val = 0; // Clear "register"
+						}
 					}
 				}
 					continue;

@@ -74,6 +74,38 @@ static int8_t f_close(int8_t vfd)
 	return (int8_t)inb(FILE_PORT);
 }
 
+int8_t f_read(int8_t vfd, void *buf, uint8_t count)
+{
+	if (count == 0)
+		return 0;
+
+	// Send READ command
+	outb(FILE_PORT, CMD_READ);
+
+	// Send vfd
+	outb(FILE_PORT, (uint8_t)vfd);
+
+	// Send count
+	outb(FILE_PORT, count);
+
+	// Get the number of bytes read
+	int8_t bytes_read = (int8_t)inb(FILE_PORT);
+
+	if (bytes_read <= 0)
+	{
+		return bytes_read; // Return 0 EOF or -1 error
+	}
+
+	// Read that many bytes into the buffer
+	uint8_t *p = (uint8_t *)buf;
+	for (int i = 0; i < bytes_read; i++)
+	{
+		p[i] = inb(FILE_PORT);
+	}
+
+	return bytes_read;
+}
+
 
 void
 	__attribute__((noreturn))
@@ -87,30 +119,48 @@ void
 
 	puts("Guest: Booted. Starting file tests...\n");
 
-	// --- Test 1: Open a new file for writing ---
-	puts("Guest: 1. Opening 'new_file.txt' (O_WRITE)... ");
-	int8_t fd1 = f_open("new_file.txt", O_WRITE);
 
-	if (fd1 < 0)
+	puts("Guest: Booted. Starting file tests...\n");
+
+	// --- Test 1: Open a shared file for reading ---
+	puts("Guest: 1. Opening 'shared.txt' (O_READ)... ");
+	int8_t fd = f_open("shared.txt", O_READ);
+
+	if (fd < 0)
 	{
 		puts("FAILED.\n");
 	}
 	else
 	{
 		puts("SUCCESS. (vfd=");
-		outb(SERIAL_PORT, '0' + fd1);
+		outb(SERIAL_PORT, '0' + fd);
 		puts(")\n");
 
-		// --- NEW: Close the file ---
-		puts("Guest: 1b. Closing 'new_file.txt'...");
-		if (f_close(fd1) == 0)
+		// --- NEW: Read from the file ---
+		char read_buffer[64];
+		// Clear the buffer
+		for (int i = 0; i < 64; i++)
 		{
-			puts("SUCCESS.\n");
+			read_buffer[i] = 0;
+		}
+
+		puts("Guest: 1b. Reading 20 bytes...\n");
+		int8_t bytes = f_read(fd, read_buffer, 20);
+
+		if (bytes < 0)
+		{
+			puts("Guest: Read FAILED.\n");
 		}
 		else
 		{
-			puts("FAILED.\n");
+			puts("Guest: Read SUCCESS. Got: '");
+			puts(read_buffer); // Print what we read
+			puts("'\n");
 		}
+
+		puts("Guest: 1c. Closing file...");
+		f_close(fd);
+		puts("DONE.\n");
 	}
 
 	// --- Test 2: Open a shared file for reading ---
