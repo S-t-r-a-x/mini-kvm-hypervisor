@@ -106,6 +106,30 @@ int8_t f_read(int8_t vfd, void *buf, uint8_t count)
 	return bytes_read;
 }
 
+int8_t f_write(int8_t vfd, const void *buf, uint8_t count)
+{
+	if (count == 0)
+		return 0;
+
+	// Send WRITE command
+	outb(FILE_PORT, CMD_WRITE);
+
+	// Send vfd
+	outb(FILE_PORT, (uint8_t)vfd);
+
+	// Send count
+	outb(FILE_PORT, count);
+
+	// Send all the data bytes
+	const uint8_t *p = (const uint8_t *)buf;
+	for (int i = 0; i < count; i++)
+	{
+		outb(FILE_PORT, p[i]);
+	}
+
+	// Get the result (bytes written or -1)
+	return (int8_t)inb(FILE_PORT);
+}
 
 void
 	__attribute__((noreturn))
@@ -123,8 +147,8 @@ void
 	puts("Guest: Booted. Starting file tests...\n");
 
 	// --- Test 1: Open a shared file for reading ---
-	puts("Guest: 1. Opening 'shared.txt' (O_READ)... ");
-	int8_t fd = f_open("shared.txt", O_READ);
+	puts("Guest: 1. Opening 'new_file.txt' (O_WRITE)... ");
+	int8_t fd = f_open("new_file.txt", O_WRITE);
 
 	if (fd < 0)
 	{
@@ -136,26 +160,19 @@ void
 		outb(SERIAL_PORT, '0' + fd);
 		puts(")\n");
 
-		// --- NEW: Read from the file ---
-		char read_buffer[64];
-		// Clear the buffer
-		for (int i = 0; i < 64; i++)
-		{
-			read_buffer[i] = 0;
-		}
+		// --- NEW: Write to the file ---
+		const char *msg = "Hello from the VM!";
+		int msg_len = 18;
+		puts("Guest: 1b. Writing 'Hello from the VM!'...\n");
+		int8_t bytes_written = f_write(fd, msg, msg_len);
 
-		puts("Guest: 1b. Reading 20 bytes...\n");
-		int8_t bytes = f_read(fd, read_buffer, 20);
-
-		if (bytes < 0)
+		if (bytes_written == msg_len)
 		{
-			puts("Guest: Read FAILED.\n");
+			puts("Guest: Write SUCCESS.\n");
 		}
 		else
 		{
-			puts("Guest: Read SUCCESS. Got: '");
-			puts(read_buffer); // Print what we read
-			puts("'\n");
+			puts("Guest: Write FAILED.\n");
 		}
 
 		puts("Guest: 1c. Closing file...");
