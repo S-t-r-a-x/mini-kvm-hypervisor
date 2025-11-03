@@ -1,3 +1,5 @@
 *.o
 *.img
 mini_hypervisor
+*.png
+*txt

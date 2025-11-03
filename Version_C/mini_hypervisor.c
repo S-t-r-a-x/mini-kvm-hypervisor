@@ -11,11 +11,27 @@
 #include <getopt.h>
 #include <stdbool.h>
 #include <pthread.h>
+#include <libgen.h>
+#include <sys/stat.h>  // For mkdir
+#include <sys/types.h> // For mkdir
 
-
+// For multiple VMs - part B
 #define GUEST_START_ADDR 0x0000 // Početna adresa za učitavanje gosta
-#define MAX_GUESTS 32 // max number of vm guests 
-#define MAX_SHARED_FILES 32 // max number of files that can be passed via the command line
+#define MAX_GUESTS 32 // max number of vm guests
+
+// For files - part C
+#define MAX_SHARED_FILES 16 // max number of shared files that can be passed via the command line
+#define MAX_VM_FILES 32 // max number of files a vm can have open
+#define MAX_PATH_LEN 512
+#define MAX_GUEST_PATH_LEN 255 // max path length that the guest can send (including null character)
+
+// opcodes
+#define CMD_OPEN 0x01
+#define CMD_CLOSE 0x02
+#define CMD_READ 0x03
+#define CMD_WRITE 0x04
+#define O_READ 0x00
+#define O_WRITE 0x01
 
 // PDE bitovi
 #define PDE64_PRESENT (1u << 0)
@@ -39,6 +55,23 @@ struct vm {
 	size_t mem_size;
 	struct kvm_run *run;
 	int run_mmap_size;
+};
+
+char *shared_files[MAX_SHARED_FILES] = {0};
+int shared_file_count = 0;
+
+// for passing params
+struct InitVMData
+{
+	int vm_id;
+	size_t mem_size;
+	long page_size;
+	char *guest_path;
+};
+struct guest_file {
+    FILE* host_fd;
+    char local_path[MAX_PATH_LEN];
+    bool in_use;
 };
 
 int vm_init(struct vm *v, size_t mem_size)
@@ -269,15 +302,111 @@ int load_guest_image(struct vm *v, const char *image_path, uint64_t load_addr) {
 	return 0;
 }
 
-// for passing params
-struct InitVMData {
-	size_t mem_size;
-	long page_size;
-	char *guest_path;
-	int file_count;
-	char **shared_files;
-};
 
+// --- NEW: Helper function to check if a file is in the shared list ---
+static bool is_shared_file(const char *path, char **original_path) {
+	for (int i = 0; i < shared_file_count; i++)
+	{
+		// Use strstr to check if the guest's path is *part* of a shared path
+		// A better check would be basename, but this is simpler.
+		if (strcmp(shared_files[i], path) == 0)
+		{
+			*original_path = shared_files[i];
+			return true;
+		}
+	}
+	return false;
+}
+
+// --- NEW: Helper function to copy a file (for COW) ---
+static bool copy_file(const char *src, const char *dest) {
+	FILE *f_src = fopen(src, "rb");
+	if (!f_src)
+		return false;
+
+	FILE *f_dest = fopen(dest, "wb");
+	if (!f_dest)
+	{
+		fclose(f_src);
+		return false;
+	}
+
+	char buf[4096];
+	size_t n;
+	while ((n = fread(buf, 1, sizeof(buf), f_src)) > 0)
+	{
+		if (fwrite(buf, 1, n, f_dest) != n)
+		{
+			fclose(f_src);
+			fclose(f_dest);
+			return false; // Write error
+		}
+	}
+
+	fclose(f_src);
+	fclose(f_dest);
+	return true;
+}
+
+char *get_guest_basename(const char *guest_path)
+{
+	// strdup to avoid modifying the original string in argv
+	char *path_copy = strdup(guest_path);
+	if (!path_copy)
+		return NULL;
+
+	// Use basename to get the filename part (e.g., "guest.img")
+	char *bname = basename(path_copy);
+
+	// strdup again to have a persistent copy of just the basename
+	char *guest_name = strdup(bname);
+	free(path_copy); // Free the first copy
+	if (!guest_name)
+		return NULL;
+
+	// Now, remove the extension (e.g., ".img")
+	char *dot = strrchr(guest_name, '.');
+	// Ensure it's not a hidden file (like ".config")
+	if (dot != NULL && dot != guest_name)
+	{
+		*dot = '\0'; // Truncate the string at the dot
+	}
+
+	return guest_name; // This (e.g., "guest") must be freed by the caller
+}
+
+static int8_t hypercall_open(struct guest_file *local_file_table, const char *host_path, const char *open_mode) {
+	int vfd = -1;
+
+	// 1. Find a free virtual file descriptor
+	for (int i = 0; i < MAX_VM_FILES; i++)
+	{
+		if (!local_file_table[i].in_use)
+		{
+			vfd = i;
+			break;
+		}
+	}
+	if (vfd == -1)
+		return -1; // No free FDs
+
+	// 2. Open the file
+	FILE *f = fopen(host_path, open_mode);
+	if (!f)
+	{
+		perror("Hypervisor: fopen failed");
+		return -1;
+	}
+
+	// 3. Store in VM's local file table
+	struct guest_file *g_file = &local_file_table[vfd];
+	g_file->host_fd = f;
+	// Store the path for debugging or future (e.g., fstat)
+	strncpy(g_file->local_path, host_path, MAX_PATH_LEN);
+	g_file->in_use = true;
+
+	return (int8_t)vfd;
+}
 
 pthread_mutex_t io_mutex;
 
@@ -294,8 +423,47 @@ void *run_vm(void *data) {
 	size_t mem_size = init_data->mem_size;
 	long page_size = init_data->page_size;
 	char *guest_path = init_data->guest_path;
-	int file_count = init_data->file_count;
-	char **shared_files = init_data->shared_files;
+	int vm_id = init_data->vm_id;
+
+	char *guest_basename = get_guest_basename(guest_path);
+	if (!guest_basename)
+	{
+		fprintf(stderr, "Failed to get basename for %s\n", guest_path);
+		return NULL;
+	}
+
+	char vm_dir_path[MAX_PATH_LEN];
+    // Creates e.g., "../Guest/guest_files"
+    sprintf(vm_dir_path, "../Guest/%s_files", guest_basename); 
+    mkdir(vm_dir_path, 0755);
+	
+	// This table is local to this thread and holds this VM's state.
+	struct guest_file my_file_table[MAX_VM_FILES];
+	memset(my_file_table, 0, sizeof(my_file_table));
+
+	enum
+	{
+		STATE_IDLE, 
+		STATE_OPEN_WANT_FLAGS,	  // State 1
+		STATE_OPEN_WANT_PATH_LEN,  // State 2
+		STATE_OPEN_WANT_PATH_BYTE, // State 3
+
+		// STATE_WRITE_WANT_VFD,
+		// STATE_WRITE_WANT_LEN,
+		// STATE_WRITE_WANT_BYTE,
+
+		// STATE_READ_WANT_VFD,
+
+		// STATE_CLOSE_WANT_VFD
+	} fcall_state = STATE_IDLE;
+
+	uint8_t hc_ret_val = 0; // "Return register" for the guest
+
+	// --- Buffers for OPEN protocol ---
+	char hc_open_path_buf[MAX_GUEST_PATH_LEN]; // stores the guests file path
+    int hc_open_path_len = 0;
+    int hc_open_path_idx = 0;
+    int hc_open_flags = 0;
 
 	if (vm_init(&v, mem_size)) {
 		printf("Failed to init the VM\n");
@@ -347,8 +515,8 @@ void *run_vm(void *data) {
 
 		switch (v.run->exit_reason) {
 			case KVM_EXIT_IO:
-				pthread_mutex_lock(&io_mutex);
 				if(v.run -> io.port == 0xE9) {
+					pthread_mutex_lock(&io_mutex);
 					// Regular in/out operation
 					if (v.run->io.direction == KVM_EXIT_IO_OUT) {
 						char *p = (char *) v.run;
@@ -364,12 +532,130 @@ void *run_vm(void *data) {
 						// Napomena: U x86 podaci se smeštaju u memoriji po little endian poretku.
 						(*data_in) = data;
 					}
+					pthread_mutex_unlock(&io_mutex);
 				}
-				else if(v.run->io.port == 0x0278) {
-					
-				} 
-				pthread_mutex_unlock(&io_mutex);
-				continue;
+				else if (v.run->io.port == 0x0278) {
+					char *io_data = (char *)v.run + v.run->io.data_offset;
+
+					if (v.run->io.direction == KVM_EXIT_IO_OUT) {
+						uint8_t out_val = (uint8_t)(*io_data);
+
+						// --- This is the new state machine logic ---
+						switch (fcall_state) {
+							// --- State 0: Idle, waiting for a command ---
+							case STATE_IDLE:
+								if (out_val == CMD_OPEN)
+								{
+									fcall_state = STATE_OPEN_WANT_FLAGS;
+									hc_open_path_idx = 0; // Reset buffers
+									hc_open_path_len = 0;
+								}
+								// --- EXPANSION: Add other commands ---
+								// else if (out_val == CMD_WRITE) {
+								//    hc_state = HC_STATE_WRITE_WANT_VFD;
+								// }
+								// else if (out_val == CMD_READ) {
+								//    hc_state = HC_STATE_READ_WANT_VFD;
+								// }
+								// else if (out_val == CMD_CLOSE) {
+								//    hc_state = HC_STATE_CLOSE_WANT_VFD;
+								// }
+								else
+								{
+									hc_ret_val = -1; // Unknown command
+									fcall_state = STATE_IDLE;
+								}
+								break;
+
+							// --- OPEN State 1: Want Flags ---
+							case STATE_OPEN_WANT_FLAGS:
+								hc_open_flags = out_val;
+								fcall_state = STATE_OPEN_WANT_PATH_LEN;
+								break;
+
+							// --- OPEN State 2: Want Path Length ---
+							case STATE_OPEN_WANT_PATH_LEN:
+								hc_open_path_len = out_val;
+								if (hc_open_path_len == 0 || hc_open_path_len == 255)
+								{
+									hc_ret_val = -1;		  // Set error
+									fcall_state = STATE_IDLE; // Reset to idle
+								}
+								else
+								{
+									fcall_state = STATE_OPEN_WANT_PATH_BYTE;
+								}
+								break;
+
+							// --- OPEN State 3: Want Path Byte(s) ---
+							case STATE_OPEN_WANT_PATH_BYTE:
+								hc_open_path_buf[hc_open_path_idx++] = out_val;
+
+								if (hc_open_path_idx == hc_open_path_len)
+								{
+									hc_open_path_buf[hc_open_path_len] = '\0';
+
+									// --- 1. All data received. Start sandboxing ---
+									char private_path[MAX_PATH_LEN];
+									sprintf(private_path, "../Guest/%s_files/%s", guest_basename, hc_open_path_buf);
+
+									char shared_check_path[MAX_PATH_LEN];
+									sprintf(shared_check_path, "../Guest/%s", hc_open_path_buf);
+
+									char *original_shared_path = NULL;
+									const char *open_mode = (hc_open_flags == O_WRITE) ? "wb" : "rb";
+									bool is_shared = is_shared_file(shared_check_path, &original_shared_path);
+									char final_host_path[MAX_PATH_LEN];
+
+									if (hc_open_flags == O_READ)
+									{
+										//Check the shared path first, then the sandboxed path.
+										if (is_shared)
+										{
+											// path is already correct
+											strncpy(final_host_path, original_shared_path, MAX_PATH_LEN);
+											
+										}
+										else if (!is_shared)
+										{
+											// Try to open the private file
+											strncpy(final_host_path, private_path, MAX_PATH_LEN);
+										}
+									}
+									// --- 4. Handle O_WRITE ---
+									else if (hc_open_flags == O_WRITE)
+									{
+										strncpy(final_host_path, private_path, MAX_PATH_LEN);
+										if (is_shared)
+										{
+											// --- 4a. Copy-on-Write (COW) ---
+											// We already built the sandbox_path,
+											// now just copy the data into it.
+											if (!copy_file(original_shared_path, final_host_path))
+											{
+												perror("Hypervisor: COW copy failed");
+												hc_ret_val = -1;
+												fcall_state = STATE_IDLE;
+												break; // Break from switch
+											}
+										}
+									}
+
+									hc_ret_val = hypercall_open(my_file_table,
+																final_host_path,
+																open_mode);
+
+									fcall_state = STATE_IDLE; // Reset to idle
+								}
+							}
+					}
+					else if (v.run->io.direction == KVM_EXIT_IO_IN) {
+						// Guest is asking for the return value
+						*io_data = hc_ret_val;
+						hc_ret_val = 0; // Clear "register"
+					}
+				}
+					continue;
 			case KVM_EXIT_HLT:
 				printf("KVM_EXIT_HLT\n");
 				stop = 1;
@@ -381,8 +667,8 @@ void *run_vm(void *data) {
 			default:
 				printf("Default - exit reason: %d\n", v.run->exit_reason);
 				break;
-    	}
-  	}
+		}
+	}
 
 	vm_destroy(&v);	
 	return NULL;
@@ -396,7 +682,6 @@ int main(int argc, char *argv[])
 	size_t mem_size = 0;
 	long page_size = -1;
 	char *guest_paths[MAX_GUESTS] = {0};
-    char *shared_files[MAX_SHARED_FILES] = {0}; 
 
 	// 1. Define your long options
     static struct option long_options[] = {
@@ -412,7 +697,6 @@ int main(int argc, char *argv[])
     const char *short_opts = "m:p:g:f:";
 
     int guest_count = 0;
-    int file_count = 0;
     int long_index = 0;
 
     enum parse_mode {
@@ -454,8 +738,8 @@ int main(int argc, char *argv[])
                         guest_paths[guest_count++] = argv[i];
                     break;
                 case PARSE_FILES:
-                    if (file_count < MAX_SHARED_FILES)
-                        shared_files[file_count++] = argv[i];
+                    if (shared_file_count < MAX_SHARED_FILES)
+                        shared_files[shared_file_count++] = argv[i];
                     break;
                 case PARSE_NONE:
                     break;
@@ -491,12 +775,12 @@ int main(int argc, char *argv[])
         	printf("\n");
         }
         else {
-            printf("%s, ", guest_paths[i]);
-        }
+			printf("%s, ", guest_paths[i]);
+		}
     }
     printf("  Shared files: ");
-    for(int i = 0; i < file_count; i++) {
-        if(i == file_count - 1) {
+    for(int i = 0; i < shared_file_count; i++) {
+        if(i == shared_file_count - 1) {
             printf("%s ", shared_files[i]);
         	printf("\n");
         }
@@ -515,8 +799,7 @@ int main(int argc, char *argv[])
 		args[i]->mem_size = mem_size;
 		args[i]->page_size = page_size;
 		args[i]->guest_path = guest_paths[i];
-		args[i]->file_count = file_count;
-		args[i]->shared_files = shared_files;
+		args[i]->vm_id = i;
     	if(pthread_create(&vm_threads[i], NULL, run_vm, args[i]) != 0) {
 			perror("pthread_create error!\n");
 			return -1;
