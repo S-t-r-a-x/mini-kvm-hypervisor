@@ -452,9 +452,9 @@ void *run_vm(void *data) {
 		// STATE_WRITE_WANT_LEN,
 		// STATE_WRITE_WANT_BYTE,
 
-		// STATE_READ_WANT_VFD,
+		STATE_READ_WANT_VFD,
 
-		// STATE_CLOSE_WANT_VFD
+		STATE_CLOSE_WANT_VFD
 	} fcall_state = STATE_IDLE;
 
 	uint8_t hc_ret_val = 0; // "Return register" for the guest
@@ -557,9 +557,9 @@ void *run_vm(void *data) {
 								// else if (out_val == CMD_READ) {
 								//    hc_state = HC_STATE_READ_WANT_VFD;
 								// }
-								// else if (out_val == CMD_CLOSE) {
-								//    hc_state = HC_STATE_CLOSE_WANT_VFD;
-								// }
+								else if (out_val == CMD_CLOSE) {
+								   fcall_state = STATE_CLOSE_WANT_VFD;
+								}
 								else
 								{
 									hc_ret_val = -1; // Unknown command
@@ -647,7 +647,32 @@ void *run_vm(void *data) {
 
 									fcall_state = STATE_IDLE; // Reset to idle
 								}
+								break;
+							case STATE_CLOSE_WANT_VFD: {
+								int vfd_to_close = (int)out_val;
+
+								// Check if vfd is valid and in use
+								if (vfd_to_close >= 0 && vfd_to_close < MAX_VM_FILES &&
+									my_file_table[vfd_to_close].in_use)
+								{
+									// Valid: close the file
+									fclose(my_file_table[vfd_to_close].host_fd);
+									my_file_table[vfd_to_close].in_use = false;
+									my_file_table[vfd_to_close].host_fd = NULL;
+
+									hc_ret_val = 0; // Success
+								}
+								else
+								{
+									// Invalid vfd
+									hc_ret_val = -1; // Errormake
+								}
+
+								fcall_state = STATE_IDLE; // Reset to idle
+								break;
 							}
+						}
+						case 
 					}
 					else if (v.run->io.direction == KVM_EXIT_IO_IN) {
 						// Guest is asking for the return value

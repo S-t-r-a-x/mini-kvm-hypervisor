@@ -36,7 +36,7 @@ static void puts(const char *s)
 	}
 }
 
-static uint8_t fopen(char* file_path, uint8_t flags){
+static uint8_t f_open(char* file_path, uint8_t flags){
 
 	// initialize file open
 	outb(FILE_PORT, CMD_OPEN);
@@ -62,6 +62,19 @@ static uint8_t fopen(char* file_path, uint8_t flags){
 	return (int8_t)inb(FILE_PORT);
 }
 
+static int8_t f_close(int8_t vfd)
+{
+	// end the close command
+	outb(FILE_PORT, CMD_CLOSE);
+
+	// send the virtual FD
+	outb(FILE_PORT, (uint8_t)vfd);
+
+	// get the result (0 or -1)
+	return (int8_t)inb(FILE_PORT);
+}
+
+
 void
 	__attribute__((noreturn))
 	__attribute__((section(".start")))
@@ -75,8 +88,8 @@ void
 	puts("Guest: Booted. Starting file tests...\n");
 
 	// --- Test 1: Open a new file for writing ---
-	puts("Guest: 1. Opening 'new_file.txt' (O_READ)... ");
-	int8_t fd1 = fopen("new_file.txt", O_READ);
+	puts("Guest: 1. Opening 'new_file.txt' (O_WRITE)... ");
+	int8_t fd1 = f_open("new_file.txt", O_WRITE);
 
 	if (fd1 < 0)
 	{
@@ -85,14 +98,25 @@ void
 	else
 	{
 		puts("SUCCESS. (vfd=");
-		outb(SERIAL_PORT, '0' + fd1); // Simple int-to-char
+		outb(SERIAL_PORT, '0' + fd1);
 		puts(")\n");
+
+		// --- NEW: Close the file ---
+		puts("Guest: 1b. Closing 'new_file.txt'...");
+		if (f_close(fd1) == 0)
+		{
+			puts("SUCCESS.\n");
+		}
+		else
+		{
+			puts("FAILED.\n");
+		}
 	}
 
 	// --- Test 2: Open a shared file for reading ---
 	// (Requires hypervisor to be run with '-f shared.txt')
 	puts("Guest: 2. Opening 'shared.txt' (O_READ)... ");
-	int8_t fd2 = fopen("shared.txt", O_READ);
+	int8_t fd2 = f_open("shared.txt", O_READ);
 
 	if (fd2 < 0)
 	{
@@ -104,7 +128,6 @@ void
 		outb(SERIAL_PORT, '0' + fd2);
 		puts(")\n");
 	}
-
 	/*
 		INSERT CODE ABOVE THIS LINE
 	*/
